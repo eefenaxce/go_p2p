@@ -1,0 +1,23 @@
+{
+  "server": {
+    "listen_addr": ":8080",
+    "server_secret": "change-this-secret-in-production",
+    "enable_stats": true,
+    "max_connections": 100,
+    "log_level": "INFO",
+    "log_path": "logs"
+  },
+  "client": {
+    "server_addr": "localhost:8080",
+    "node_id": "",
+    "node_name": "",
+    "auth_token": "",
+    "tun_name": "vlan0",
+    "tun_ip": "10.0.0.2",
+    "tun_subnet": "255.255.255.0",
+    "enable_stats": true,
+    "auto_reconnect": true,
+    "log_level": "INFO",
+    "log_path": "logs"
+  }
+}

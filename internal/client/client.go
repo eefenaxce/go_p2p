@@ -117,9 +117,16 @@ func (c *Client) Connect() error {
 	c.conn = conn
 	logger.Infof("已连接到服务器: %s", c.config.ServerAddr)
 
+	// 认证并获取服务端分配的IP
 	if err := c.authenticate(); err != nil {
 		c.conn.Close()
 		return fmt.Errorf("认证失败: %w", err)
+	}
+
+	// 创建TUN设备（使用服务端分配的IP）
+	if err := c.CreateTUNDevice(); err != nil {
+		c.conn.Close()
+		return fmt.Errorf("创建TUN设备失败: %w", err)
 	}
 
 	c.mu.Lock()
@@ -142,7 +149,7 @@ func (c *Client) authenticate() error {
 	authReq := protocol.AuthRequest{
 		NodeID:     c.config.NodeID,
 		AuthToken:  c.config.AuthToken,
-		IPAddress:  c.config.TUNIP,
+		IPAddress:  "", // 客户端不再指定IP，由服务端分配
 		MacAddress: macAddr,
 		Version:    "1.0.0",
 	}
@@ -189,6 +196,10 @@ func (c *Client) authenticate() error {
 
 	c.sessionID = authResp.SessionID
 	c.statsManager.RegisterNode(c.config.NodeID)
+
+	// 保存服务端分配的IP地址和子网掩码
+	c.config.TUNIP = authResp.IPAddress
+	c.config.TUNSubnet = authResp.SubnetMask
 
 	logger.Infof("认证成功，分配IP: %s, 子网掩码: %s, 网关: %s",
 		authResp.IPAddress, authResp.SubnetMask, authResp.Gateway)
@@ -273,12 +284,22 @@ func (c *Client) writeLoop() {
 		return
 	}
 
+	// 计算最大可用数据大小：MaxPacketSize - HeaderSize - JSON序列化开销
+	// 预留200字节用于JSON序列化开销（根据实际情况调整）
+	maxDataSize := protocol.MaxPacketSize - protocol.HeaderSize - 200
+
 	for {
 		select {
 		case <-c.stopChan:
 			return
 		case data := <-c.tunDevice.GetReadChannel():
 			if c.conn != nil {
+				// 检查并截断数据，确保序列化后的数据包不会超过大小限制
+				if len(data) > maxDataSize {
+					logger.Warnf("数据大小超过限制，截断数据: %d -> %d", len(data), maxDataSize)
+					data = data[:maxDataSize]
+				}
+
 				dataPacket := protocol.DataPacket{
 					SourceNodeID: c.config.NodeID,
 					DestNodeID:   "",

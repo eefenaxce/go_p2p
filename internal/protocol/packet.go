@@ -9,7 +9,7 @@ import (
 
 const (
 	ProtocolVersion = 1
-	MaxPacketSize   = 1500
+	MaxPacketSize   = 3000 // 增加最大数据包大小，考虑JSON序列化和Base64编码的开销
 	HeaderSize      = 20
 )
 

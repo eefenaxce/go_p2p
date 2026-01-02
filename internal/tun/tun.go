@@ -12,10 +12,11 @@ import (
 	"time"
 
 	"github.com/eefenaxce/vlan-tool/internal/logger"
+	"golang.zx2c4.com/wireguard/tun"
 )
 
 const (
-	DefaultMTU = 1500
+	DefaultMTU = 1300 // 减小MTU，为JSON序列化和协议头留出空间
 	BufferSize = 4096
 	MaxRetries = 3
 	RetryDelay = 2 * time.Second
@@ -24,6 +25,7 @@ const (
 type TUNDevice struct {
 	name       string
 	fd         *os.File
+	tunDev     tun.Device
 	mtu        int
 	ipAddress  net.IP
 	subnetMask net.IPMask
@@ -163,32 +165,58 @@ func (t *TUNDevice) readLoop() {
 		case <-t.stopChan:
 			return
 		default:
-			if t.fd == nil {
-				logger.Warnf("文件描述符为空，无法读取数据")
+			var n int
+			var err error
+			var buffer []byte
+
+			if t.tunDev != nil {
+				batchSize := t.tunDev.BatchSize()
+				bufs := make([][]byte, batchSize)
+				sizes := make([]int, batchSize)
+				for i := range bufs {
+					bufs[i] = make([]byte, t.mtu)
+				}
+
+				n, err = t.tunDev.Read(bufs, sizes, 0)
+				if err == nil && n > 0 {
+					for i := 0; i < n; i++ {
+						if sizes[i] > 0 {
+							data := make([]byte, sizes[i])
+							copy(data, bufs[i][:sizes[i]])
+							select {
+							case t.readChan <- data:
+							default:
+								logger.Warnf("读取通道已满，丢弃数据包")
+							}
+						}
+					}
+					continue
+				}
+			} else if t.fd != nil {
+				buffer = make([]byte, t.mtu+4)
+				n, err = t.fd.Read(buffer)
+				if err == nil && n > 0 {
+					data := make([]byte, n)
+					copy(data, buffer[:n])
+					select {
+					case t.readChan <- data:
+					default:
+						logger.Warnf("读取通道已满，丢弃数据包")
+					}
+					continue
+				}
+			} else {
+				logger.Warnf("TUN设备未初始化，无法读取数据")
 				time.Sleep(time.Second)
 				continue
 			}
 
-			buffer := make([]byte, t.mtu+4)
-			n, err := t.fd.Read(buffer)
 			if err != nil {
 				if !t.isUp {
 					return
 				}
 				logger.Errorf("读取TUN设备失败: %v", err)
 				time.Sleep(time.Second)
-				continue
-			}
-
-			if n > 0 {
-				data := make([]byte, n)
-				copy(data, buffer[:n])
-
-				select {
-				case t.readChan <- data:
-				default:
-					logger.Warnf("读取通道已满，丢弃数据包")
-				}
 			}
 		}
 	}
@@ -233,6 +261,9 @@ func (t *TUNDevice) Close() error {
 
 func (t *TUNDevice) closeWindows() error {
 	logger.Infof("关闭Windows TUN设备: %s", t.name)
+	if t.tunDev != nil {
+		return t.tunDev.Close()
+	}
 	if t.fd != nil {
 		return t.fd.Close()
 	}
@@ -276,6 +307,15 @@ func (t *TUNDevice) Read() ([]byte, error) {
 func (t *TUNDevice) Write(data []byte) error {
 	if !t.isUp {
 		return fmt.Errorf("设备未启动: %s", t.name)
+	}
+
+	if t.tunDev != nil {
+		bufs := [][]byte{data}
+		_, err := t.tunDev.Write(bufs, 0)
+		if err != nil {
+			return fmt.Errorf("写入TUN设备失败: %w", err)
+		}
+		return nil
 	}
 
 	if t.fd == nil {

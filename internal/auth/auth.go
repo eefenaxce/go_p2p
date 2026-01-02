@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -13,41 +14,44 @@ import (
 )
 
 const (
-	TokenLength     = 32
-	SessionTimeout  = 30 * time.Minute
+	TokenLength       = 32
+	SessionTimeout    = 30 * time.Minute
 	HeartbeatInterval = 30 * time.Second
 	MaxFailedAttempts = 5
 	LockoutDuration   = 5 * time.Minute
 )
 
 var (
-	ErrInvalidToken      = errors.New("无效的认证令牌")
-	ErrSessionExpired    = errors.New("会话已过期")
-	ErrNodeNotFound      = errors.New("节点未找到")
-	ErrTooManyAttempts   = errors.New("尝试次数过多，账户已锁定")
+	ErrInvalidToken         = errors.New("无效的认证令牌")
+	ErrSessionExpired       = errors.New("会话已过期")
+	ErrNodeNotFound         = errors.New("节点未找到")
+	ErrTooManyAttempts      = errors.New("尝试次数过多，账户已锁定")
 	ErrAlreadyAuthenticated = errors.New("节点已认证")
 )
 
 type Node struct {
-	NodeID     string
-	NodeName   string
-	AuthToken  string
-	IPAddress  string
-	MacAddress string
-	SessionID  uint32
-	LastSeen   time.Time
-	IsOnline   bool
+	NodeID         string
+	NodeName       string
+	AuthToken      string
+	IPAddress      string
+	MacAddress     string
+	SessionID      uint32
+	LastSeen       time.Time
+	IsOnline       bool
 	FailedAttempts int
-	LockedUntil time.Time
+	LockedUntil    time.Time
 }
 
 type AuthManager struct {
-	nodes          map[string]*Node
-	sessions       map[uint32]*Node
-	nodeSecrets    map[string]string
-	mu             sync.RWMutex
-	nextSessionID  uint32
-	serverSecret   string
+	nodes         map[string]*Node
+	sessions      map[uint32]*Node
+	nodeSecrets   map[string]string
+	mu            sync.RWMutex
+	nextSessionID uint32
+	serverSecret  string
+	ipPool        map[string]bool // IP地址池，记录哪些IP已被使用
+	baseIP        string          // 基础IP地址，用于自动分配
+	nextIPIndex   uint32          // 下一个要分配的IP索引
 }
 
 func NewAuthManager(serverSecret string) *AuthManager {
@@ -57,6 +61,9 @@ func NewAuthManager(serverSecret string) *AuthManager {
 		nodeSecrets:   make(map[string]string),
 		nextSessionID: 1,
 		serverSecret:  serverSecret,
+		ipPool:        make(map[string]bool),
+		baseIP:        "10.0.0.2",
+		nextIPIndex:   0,
 	}
 }
 
@@ -77,14 +84,14 @@ func (am *AuthManager) RegisterNode(nodeID, nodeName, authToken, ipAddress, macA
 	}
 
 	node := &Node{
-		NodeID:      nodeID,
-		NodeName:    nodeName,
-		AuthToken:   authToken,
-		IPAddress:   ipAddress,
-		MacAddress:  macAddress,
-		SessionID:   0,
-		LastSeen:    time.Now(),
-		IsOnline:    false,
+		NodeID:         nodeID,
+		NodeName:       nodeName,
+		AuthToken:      authToken,
+		IPAddress:      ipAddress,
+		MacAddress:     macAddress,
+		SessionID:      0,
+		LastSeen:       time.Now(),
+		IsOnline:       false,
 		FailedAttempts: 0,
 	}
 
@@ -131,15 +138,22 @@ func (am *AuthManager) Authenticate(nodeID, authToken, ipAddress, macAddress str
 	sessionID := am.nextSessionID
 	am.nextSessionID++
 
+	// 忽略客户端提供的IP，服务端自动分配IP地址
+	allocatedIP := am.allocateIP()
+	if allocatedIP == "" {
+		logger.Errorf("无法为节点 %s 分配IP地址", nodeID)
+		return 0, errors.New("无法分配IP地址")
+	}
+
 	node.SessionID = sessionID
-	node.IPAddress = ipAddress
+	node.IPAddress = allocatedIP
 	node.MacAddress = macAddress
 	node.LastSeen = time.Now()
 	node.IsOnline = true
 
 	am.sessions[sessionID] = node
 
-	logger.Infof("节点认证成功: %s (会话ID: %d, IP: %s)", nodeID, sessionID, ipAddress)
+	logger.Infof("节点认证成功: %s (会话ID: %d, 分配IP: %s)", nodeID, sessionID, allocatedIP)
 
 	return sessionID, nil
 }
@@ -183,12 +197,19 @@ func (am *AuthManager) Logout(sessionID uint32) error {
 		return ErrSessionExpired
 	}
 
+	// 保存要释放的IP地址
+	ipAddress := node.IPAddress
+
 	node.IsOnline = false
 	node.SessionID = 0
+	node.IPAddress = "" // 清除节点的IP地址
 
 	delete(am.sessions, sessionID)
 
-	logger.Infof("节点登出: %s (会话ID: %d)", node.NodeID, sessionID)
+	// 释放IP地址，以便其他客户端可以使用
+	am.releaseIP(ipAddress)
+
+	logger.Infof("节点登出: %s (会话ID: %d，释放IP: %s)", node.NodeID, sessionID, ipAddress)
 
 	return nil
 }
@@ -279,10 +300,18 @@ func (am *AuthManager) CleanupExpiredSessions() {
 
 	for _, sessionID := range expiredSessions {
 		node := am.sessions[sessionID]
+		// 保存要释放的IP地址
+		ipAddress := node.IPAddress
+
 		node.IsOnline = false
 		node.SessionID = 0
+		node.IPAddress = "" // 清除节点的IP地址
 		delete(am.sessions, sessionID)
-		logger.Infof("清理过期会话: %s (会话ID: %d)", node.NodeID, sessionID)
+
+		// 释放IP地址，以便其他客户端可以使用
+		am.releaseIP(ipAddress)
+
+		logger.Infof("清理过期会话: %s (会话ID: %d，释放IP: %s)", node.NodeID, sessionID, ipAddress)
 	}
 
 	if len(expiredSessions) > 0 {
@@ -334,6 +363,49 @@ func (am *AuthManager) VerifyNodeSecret(nodeID, secret string) bool {
 	}
 
 	return secret == expectedSecret
+}
+
+func (am *AuthManager) allocateIP() string {
+	// 解析基础IP地址
+	baseIP := net.ParseIP(am.baseIP).To4()
+	if baseIP == nil {
+		logger.Errorf("无效的基础IP地址: %s", am.baseIP)
+		return ""
+	}
+
+	// 生成下一个可用的IP地址
+	for i := uint32(0); i < 254; i++ { // 最多尝试254个IP地址
+		index := am.nextIPIndex + i
+		if index > 254 { // 避免超过255的限制
+			index = index % 254
+		}
+
+		// 生成IP地址
+		newIP := make(net.IP, len(baseIP))
+		copy(newIP, baseIP)
+		newIP[3] = baseIP[3] + byte(index)
+
+		ipStr := newIP.String()
+
+		// 检查该IP是否已被使用
+		if !am.ipPool[ipStr] {
+			// 标记该IP为已使用
+			am.ipPool[ipStr] = true
+			am.nextIPIndex = index + 1
+			logger.Infof("分配IP地址: %s", ipStr)
+			return ipStr
+		}
+	}
+
+	logger.Errorf("没有可用的IP地址可以分配")
+	return ""
+}
+
+func (am *AuthManager) releaseIP(ipAddress string) {
+	if ipAddress != "" {
+		delete(am.ipPool, ipAddress)
+		logger.Infof("释放IP地址: %s", ipAddress)
+	}
 }
 
 func (am *AuthManager) HashPassword(password string) string {
